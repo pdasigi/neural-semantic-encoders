@@ -7,7 +7,7 @@ class NSE(Layer):
     Simple Neural Semantic Encoder.
     '''
     def __init__(self, output_dim, weights=None, input_length=None,
-                 composer_activation='linear', return_mode='last_output', batch_size=32, **kwargs):
+                 composer_activation='linear', return_mode='last_output', **kwargs):
         '''
         Arguments:
         output_dim (int)
@@ -20,19 +20,20 @@ class NSE(Layer):
             all_outputs returns the whole sequence of h_ts
             output_and_memory returns the last output and the last memory concatenated
                 (needed if this layer is followed by a MMA-NSE)
-        batch_size (int): We need to know this for the writer, because it is a stateful LSTM
         '''
         self.output_dim = output_dim
         self.input_dim = output_dim  # Equation 2 in the paper makes this assumption.
         self.initial_weights = weights
         self.input_spec = [InputSpec(ndim=3)]
         self.input_length = input_length
-        kwargs['batch_input_shape'] = (batch_size, self.input_length, self.input_dim)
+        kwargs['input_shape'] = (self.input_length, self.input_dim)
         super(NSE, self).__init__(**kwargs)
         self.reader = LSTM(self.output_dim, return_sequences=True, name="{}_reader".format(self.name))
-        # Stateful because we are going to make a call to LSTM.call() at each timestep with an input
-        # of length 1 in write_and_compose.
-        self.writer = LSTM(self.output_dim, stateful=True, name="{}_writer".format(self.name))
+        # TODO: Let the writer use parameter dropout and any consume_less mode.
+        # Setting dropout to 0 here to eliminate the need for constants.
+        # Setting consume_less to mem to eliminate need for preprocessing
+        self.writer = LSTM(self.output_dim, dropout_W=0.0, dropout_U=0.0, consume_less="mem",
+                           name="{}_writer".format(self.name))
         self.composer = Dense(self.output_dim, activation=composer_activation,
                               name="{}_composer".format(self.name))
         if return_mode not in ["last_output", "all_outputs", "output_and_memory"]:
@@ -58,7 +59,7 @@ class NSE(Layer):
 
     def build(self, input_shape):
         self.input_spec = [InputSpec(shape=input_shape)]
-        batch_size, _, input_dim = self.batch_input_shape
+        batch_size, _, input_dim = input_shape
         if input_dim != self.output_dim:
             raise Exception("NSE needs the input dim to be the same as output dim")
         writer_input_shape = (batch_size, 1, input_dim)  # Will process one timestep at a time
@@ -95,20 +96,23 @@ class NSE(Layer):
         o_mask = self.reader.compute_mask(input_to_read, input_mask)
         return o, mem_0, o_mask
 
-    def compose_and_write_step(self, o_t, memory_states):
+    def compose_and_write_step(self, o_t, states):
         '''
         This method is a step function that updates the memory at each time step and produces
         a new output vector (Equations 2 to 6 in the paper).
 
         Inputs:
             o_t (batch_size, output_dim)
-            mem_tm1 (batch_size, input_length, output_dim)
+            states (list[Tensor])
+                mem_tm1 (batch_size, input_length, output_dim)
+                writer_h_tm1 (batch_size, output_dim)
+                writer_c_tm1 (batch_size, output_dim)
 
         Outputs:
             h_t (batch_size, output_dim)
             mem_t (batch_size, input_length, output_dim)
         '''
-        mem_tm1 = memory_states[0]
+        mem_tm1, writer_h_tm1, writer_c_tm1 = states
         # Selecting relevant memory slots, Equation 2
         z_t = K.softmax(K.sum(K.expand_dims(o_t, dim=1) * mem_tm1, axis=2))  # (batch_size, input_length)
         # Summarizing memory, Equation 3
@@ -116,8 +120,11 @@ class NSE(Layer):
         # Composition, Equation 4
         # TODO: Do we pass any mask information here?
         c_t = self.composer.call(K.concatenate([o_t, m_rt]))  # (batch_size, output_dim)
-        # Making a call to LSTM.call with input length = 1 (expand_dims), Equation 5
-        h_t = self.writer.call(K.expand_dims(c_t, dim=1))  # (batch_size, output_dim)
+        # Collecting the necessary variables to directly call writer's step function.
+        writer_constants = self.writer.get_constants(c_t)  # returns dropouts for W and U (all 1s, see init)
+        writer_states = [writer_h_tm1, writer_c_tm1] + writer_constants
+        # Making a call to writer's step function, Equation 5
+        h_t, [_, writer_c_t] = self.writer.step(c_t, writer_states)  # h_t, writer_c_t: (batch_size, output_dim)
         tiled_z_t = K.tile(K.expand_dims(z_t), (self.output_dim))  # (batch_size, input_length, output_dim)
         input_length = K.shape(mem_tm1)[1]
         # (batch_size, input_length, output_dim)
@@ -125,22 +132,25 @@ class NSE(Layer):
         # Updating memory. First term in summation corresponds to selective forgetting and the second term to
         # selective addition. Equation 6.
         mem_t = mem_tm1 * (1 - tiled_z_t) + tiled_h_t * tiled_z_t  # (batch_size, input_length, output_dim)
-        return h_t, [mem_t]
+        return h_t, [mem_t, h_t, writer_c_t]
 
     def call(self, x, mask=None):
         # input_shape = (batch_size, input_length, input_dim). This needs to be defined in build.
         input_shape = self.input_spec[0].shape
         input_length = input_shape[1]
         read_output, init_mem, output_mask = self.read(x)
-        initial_states = [init_mem]
+        initial_write_states = self.writer.get_initial_states(x)  # returns h_0 and c_0 of the writer LSTM
+        initial_states = [init_mem] + initial_write_states
         # last_output: (batch_size, output_dim)
         # all_outputs: (batch_size, input_length, output_dim)
-        # memory_states: (input_length, batch_size, input_length, output_dim), because we have one memory
-        #       state containing memories related to all timesteps, for each time step.
-        last_output, all_outputs, memory_states = K.rnn(self.compose_and_write_step, read_output, initial_states,
+        # states:
+        #       memory_states: (input_length, batch_size, input_length, output_dim), because we have one memory
+        #               state containing memories related to all timesteps, for each time step.
+        #       all_outputs
+        #       all_writer_cts
+        last_output, all_outputs, states = K.rnn(self.compose_and_write_step, read_output, initial_states,
                                                         mask=output_mask, input_length=input_length)
-        # We have written all time steps in the batch. Time to reset the writer's states.
-        self.writer.reset_states()
+        memory_states = states[0]
         last_memory = memory_states[-1]
         if self.return_mode == "last_output":
             return last_output
