@@ -8,12 +8,11 @@ class NSE(Layer):
     '''
     Simple Neural Semantic Encoder.
     '''
-    def __init__(self, output_dim, weights=None, input_length=None,
-                 composer_activation='linear', return_mode='last_output', **kwargs):
+    def __init__(self, output_dim, input_length=None, composer_activation='linear',
+                 return_mode='last_output', weights=None, **kwargs):
         '''
         Arguments:
         output_dim (int)
-        weights (list): Initial weights
         input_length (int)
         composer_activation (str): activation used in the MLP
         return_mode (str): One of last_output, all_outputs, output_and_memory
@@ -22,12 +21,14 @@ class NSE(Layer):
             all_outputs returns the whole sequence of h_ts
             output_and_memory returns the last output and the last memory concatenated
                 (needed if this layer is followed by a MMA-NSE)
+        weights (list): Initial weights
         '''
         self.output_dim = output_dim
         self.input_dim = output_dim  # Equation 2 in the paper makes this assumption.
         self.initial_weights = weights
         self.input_spec = [InputSpec(ndim=3)]
         self.input_length = input_length
+        self.composer_activation = composer_activation
         kwargs['input_shape'] = (self.input_length, self.input_dim)
         super(NSE, self).__init__(**kwargs)
         self.reader = LSTM(self.output_dim, return_sequences=True, name="{}_reader".format(self.name))
@@ -36,7 +37,7 @@ class NSE(Layer):
         # Setting consume_less to mem to eliminate need for preprocessing
         self.writer = LSTM(self.output_dim, dropout_W=0.0, dropout_U=0.0, consume_less="mem",
                            name="{}_writer".format(self.name))
-        self.composer = Dense(self.output_dim, activation=composer_activation,
+        self.composer = Dense(self.output_dim, activation=self.composer_activation,
                               name="{}_composer".format(self.name))
         if return_mode not in ["last_output", "all_outputs", "output_and_memory"]:
             raise Exception("Unrecognized return mode: %s" % (return_mode))
@@ -195,6 +196,15 @@ class NSE(Layer):
             expanded_last_output = K.expand_dims(last_output, dim=1)  # (batch_size, 1, output_dim)
             # (batch_size, 1+input_length, output_dim)
             return K.concatenate([expanded_last_output, last_memory], axis=1)
+
+    def get_config(self):
+        config = {'output_dim': self.output_dim,
+                  'input_length': self.input_length,
+                  'composer_activation': self.composer_activation,
+                  'return_mode': self.return_mode}
+        base_config = super(NSE, self).get_config()
+        config.update(base_config)
+        return config
 
 class MultipleMemoryAccessNSE(NSE):
     '''
