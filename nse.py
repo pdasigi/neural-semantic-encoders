@@ -29,7 +29,6 @@ class NSE(Layer):
         self.input_spec = [InputSpec(ndim=3)]
         self.input_length = input_length
         self.composer_activation = composer_activation
-        kwargs['input_shape'] = (self.input_length, self.input_dim)
         super(NSE, self).__init__(**kwargs)
         self.reader = LSTM(self.output_dim, return_sequences=True, name="{}_reader".format(self.name))
         # TODO: Let the writer use parameter dropout and any consume_less mode.
@@ -60,13 +59,11 @@ class NSE(Layer):
             # return_mode is output_and_memory or last_output.
             return None
 
-    @staticmethod
-    def get_composer_input_shape(input_shape):
+    def get_composer_input_shape(self, input_shape):
         # Takes concatenation of output and memory summary
-        return (input_shape[0], input_shape[2] * 2)
+        return (input_shape[0], self.output_dim * 2)
 
-    @staticmethod
-    def get_reader_input_shape(input_shape):
+    def get_reader_input_shape(self, input_shape):
         return input_shape
 
     def build(self, input_shape):
@@ -106,7 +103,7 @@ class NSE(Layer):
         '''
         input_to_read = nse_input
         mem_0 = input_to_read
-        o = self.reader.call(input_to_read)
+        o = self.reader.call(input_to_read, input_mask)
         o_mask = self.reader.compute_mask(input_to_read, input_mask)
         return o, [mem_0], o_mask
 
@@ -222,13 +219,11 @@ class MultipleMemoryAccessNSE(NSE):
         nse_input_shape = (input_shape[0], input_shape[1]/2, input_shape[2])
         return super(MultipleMemoryAccessNSE, self).get_output_shape_for(nse_input_shape)
 
-    @staticmethod
-    def get_reader_input_shape(input_shape):
-        return (input_shape[0], input_shape[1]/2, input_shape[2])
+    def get_reader_input_shape(self, input_shape):
+        return (input_shape[0], input_shape[1]/2, self.output_dim)
 
-    @staticmethod
-    def get_composer_input_shape(input_shape):
-        return (input_shape[0], input_shape[2] * 3)
+    def get_composer_input_shape(self, input_shape):
+        return (input_shape[0], self.output_dim * 3)
 
     @overrides
     def read(self, nse_input, input_mask=None):
@@ -243,7 +238,7 @@ class MultipleMemoryAccessNSE(NSE):
         input_to_read = nse_input[:, :read_input_length, :]
         initial_shared_memory = nse_input[:, read_input_length:, :]
         mem_0 = input_to_read
-        o = self.reader.call(input_to_read)
+        o = self.reader.call(input_to_read, input_mask)
         o_mask = self.reader.compute_mask(input_to_read, input_mask)
         return o, [mem_0, initial_shared_memory], o_mask
 
