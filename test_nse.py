@@ -2,7 +2,7 @@ from keras.models import Model
 from keras.layers import Input, Embedding, LSTM, Lambda
 from keras import backend as K
 import numpy
-from nse import NSE, MultipleMemoryAccessNSE
+from nse import NSE, MultipleMemoryAccessNSE, InputMemoryMerger
 
 input_val1 = numpy.random.randint(low=0, high=10, size=(1000, 10))
 input_val2 = numpy.random.randint(low=0, high=10, size=(1000, 10))
@@ -18,14 +18,7 @@ nse_embed_input2 = embedding_for_nse(input2)  # (None, 10, 50)
 
 nse_output = nse_encoder(nse_embed_input1)  # (None, 11, 50)
 
-def make_input_for_mmanse(layer_outputs):
-    nse_output_and_memory = layer_outputs[0]
-    shared_memory = nse_output_and_memory[:, 1:, :]  # (None, 10, 50)
-    mmanse_embed_input = layer_outputs[1]  # (None, 10, 50)
-    return K.concatenate([mmanse_embed_input, shared_memory], axis=1)
-
-get_output_shape = lambda input_shapes: (input_shapes[1][0], input_shapes[1][1]*2, input_shapes[1][2])
-mmanse_input = Lambda(make_input_for_mmanse, output_shape=get_output_shape)([nse_output, nse_embed_input2])
+mmanse_input = InputMemoryMerger()([nse_output, nse_embed_input2])
 
 mmanse_encoder = MultipleMemoryAccessNSE(50)
 mmanse_output = mmanse_encoder(mmanse_input)

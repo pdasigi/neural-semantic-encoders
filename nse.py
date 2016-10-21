@@ -53,11 +53,15 @@ class NSE(Layer):
             return (input_shape[0], input_length + 1, self.output_dim)
 
     def compute_mask(self, input, mask):
-        if self.return_mode == "all_outputs":
-            return mask
-        else:
-            # return_mode is output_and_memory or last_output.
+        if mask is None or self.return_mode == "last_output":
             return None
+        elif self.return_mode == "all_outputs":
+            return mask  # (batch_size, input_length)
+        else:
+            # Return mode is output_and_memory
+            # Mask memory corresponding to all the inputs that are masked, and do not mask the output
+            # (batch_size, input_length + 1)
+            return K.cast(K.concatenate([K.zeros_like(mask[:, :1]), mask]), 'uint8')
 
     def get_composer_input_shape(self, input_shape):
         # Takes concatenation of output and memory summary
@@ -125,7 +129,6 @@ class NSE(Layer):
         Implements equation 4 or 12 in the paper.
         '''
         # Composition, Equation 4
-        # TODO: Do we pass any mask information here?
         c_t = self.composer.call(K.concatenate(output_memory_list))  # (batch_size, output_dim)
         return c_t
 
@@ -256,3 +259,35 @@ class MultipleMemoryAccessNSE(NSE):
         mem_t = self.update_memory(z_t, h_t, mem_tm1)
         shared_mem_t = self.update_memory(shared_z_t, h_t, shared_mem_tm1)
         return h_t, [mem_t, shared_mem_t, h_t, writer_c_t]
+
+
+class InputMemoryMerger(Layer):
+    '''
+    This layer taks as input the output of a NSE layer, and the embedded input to a MMANSE layer, and prepares
+    a single input tensor for MMANSE that is a concatenation of the first sentence's memory and the second
+    sentence's embedding.
+    This is a concrete layer instead of a lambda function because we want to support masking.
+    '''
+    def __init__(self, **kwargs):
+        self.supports_masking = True
+        super(InputMemoryMerger, self).__init__(**kwargs)
+
+    def get_output_shape_for(self, input_shapes):
+        return (input_shapes[1][0], input_shapes[1][1]*2, input_shapes[1][2])
+
+    def compute_mask(self, inputs, mask=None):
+        if mask is None:
+            return None
+        elif mask == [None, None]:
+            return None
+        else:
+            nse_output_mask, mmanse_embed_mask = mask
+            memory_mask = nse_output_mask[:, 1:]  # (batch_size, nse_input_length)
+            return K.concatenate([mmanse_embed_mask, memory_mask], axis=1)  # (batch_size, nse_input_length * 2)
+        
+    def call(self, inputs, mask=None):
+        nse_output_and_memory = inputs[0]
+        mmanse_embed_input = inputs[1]  # (batch_size, nse_input_length, output_dim)
+        shared_memory = nse_output_and_memory[:, 1:, :]  # (batch_size, nse_input_length, output_dim)
+        return K.concatenate([mmanse_embed_input, shared_memory], axis=1)
+        
