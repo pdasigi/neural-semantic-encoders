@@ -1,3 +1,4 @@
+import sys
 from overrides import overrides
 
 from keras import backend as K
@@ -36,7 +37,7 @@ class NSE(Layer):
         # Setting consume_less to mem to eliminate need for preprocessing
         self.writer = LSTM(self.output_dim, dropout_W=0.0, dropout_U=0.0, consume_less="mem",
                            name="{}_writer".format(self.name))
-        self.composer = Dense(self.output_dim, activation=self.composer_activation,
+        self.composer = Dense(self.output_dim * 2, activation=self.composer_activation,
                               name="{}_composer".format(self.name))
         if return_mode not in ["last_output", "all_outputs", "output_and_memory"]:
             raise Exception("Unrecognized return mode: %s" % (return_mode))
@@ -72,12 +73,14 @@ class NSE(Layer):
 
     def build(self, input_shape):
         self.input_spec = [InputSpec(shape=input_shape)]
-        batch_size, _, input_dim = input_shape
-        if input_dim != self.output_dim:
-            raise Exception("NSE needs the input dim to be the same as output dim")
+        input_dim = input_shape[-1]
+        assert self.reader.return_sequences, "The reader has to return sequences!"
         reader_input_shape = self.get_reader_input_shape(input_shape)
-        writer_input_shape = (batch_size, 1, input_dim)  # Will process one timestep at a time
+        print >>sys.stderr, "NSE reader input shape:", reader_input_shape 
+        writer_input_shape = (input_shape[0], 1, self.output_dim * 2)  # Will process one timestep at a time
+        print >>sys.stderr, "NSE writer input shape:", writer_input_shape 
         composer_input_shape = self.get_composer_input_shape(input_shape)
+        print >>sys.stderr, "NSE composer input shape:", composer_input_shape 
         self.reader.build(reader_input_shape)
         self.writer.build(writer_input_shape)
         self.composer.build(composer_input_shape)
@@ -100,16 +103,17 @@ class NSE(Layer):
         Input: nse_input (batch_size, input_length, input_dim)
         Outputs:
             o (batch_size, input_length, output_dim)
-            mem_0 (batch_size, input_length, output_dim)
+            flattened_mem_0 (batch_size, input_length * output_dim)
  
         While this method simply copies input to mem_0, variants that inherit from this class can do
         something fancier.
         '''
         input_to_read = nse_input
         mem_0 = input_to_read
+        flattened_mem_0 = K.batch_flatten(mem_0)
         o = self.reader.call(input_to_read, input_mask)
         o_mask = self.reader.compute_mask(input_to_read, input_mask)
-        return o, [mem_0], o_mask
+        return o, [flattened_mem_0], o_mask
 
     @staticmethod
     def summarize_memory(o_t, mem_tm1):
@@ -150,19 +154,23 @@ class NSE(Layer):
         '''
         This method is a step function that updates the memory at each time step and produces
         a new output vector (Equations 2 to 6 in the paper).
-
+        The memory_state is flattened because K.rnn requires all states to be of the same shape as the output,
+        because it uses the same mask for the output and the states.
         Inputs:
             o_t (batch_size, output_dim)
             states (list[Tensor])
-                mem_tm1 (batch_size, input_length, output_dim)
+                flattened_mem_tm1 (batch_size, input_length * output_dim)
                 writer_h_tm1 (batch_size, output_dim)
                 writer_c_tm1 (batch_size, output_dim)
 
         Outputs:
             h_t (batch_size, output_dim)
-            mem_t (batch_size, input_length, output_dim)
+            flattened_mem_t (batch_size, input_length * output_dim)
         '''
-        mem_tm1, writer_h_tm1, writer_c_tm1 = states
+        flattened_mem_tm1, writer_h_tm1, writer_c_tm1 = states
+        input_mem_shape = K.shape(flattened_mem_tm1)
+        mem_tm1_shape = (input_mem_shape[0], input_mem_shape[1]/self.output_dim, self.output_dim)
+        mem_tm1 = K.reshape(flattened_mem_tm1, mem_tm1_shape)  # (batch_size, input_length, output_dim)
         z_t, m_rt = self.summarize_memory(o_t, mem_tm1)
         c_t = self.compose_memory_and_output([o_t, m_rt])
         # Collecting the necessary variables to directly call writer's step function.
@@ -171,11 +179,12 @@ class NSE(Layer):
         # Making a call to writer's step function, Equation 5
         h_t, [_, writer_c_t] = self.writer.step(c_t, writer_states)  # h_t, writer_c_t: (batch_size, output_dim)
         mem_t = self.update_memory(z_t, h_t, mem_tm1)
-        return h_t, [mem_t, h_t, writer_c_t]
+        flattened_mem_t = K.batch_flatten(mem_t)
+        return h_t, [flattened_mem_t, h_t, writer_c_t]
 
     def call(self, x, mask=None):
         # input_shape = (batch_size, input_length, input_dim). This needs to be defined in build.
-        read_output, initial_memory_states, output_mask = self.read(x)
+        read_output, initial_memory_states, output_mask = self.read(x, mask)
         initial_write_states = self.writer.get_initial_states(read_output)  # h_0 and c_0 of the writer LSTM
         initial_states = initial_memory_states + initial_write_states
         # last_output: (batch_size, output_dim)
@@ -239,15 +248,19 @@ class MultipleMemoryAccessNSE(NSE):
         input_length = K.shape(nse_input)[1]
         read_input_length = input_length/2
         input_to_read = nse_input[:, :read_input_length, :]
-        initial_shared_memory = nse_input[:, read_input_length:, :]
-        mem_0 = input_to_read
+        initial_shared_memory = K.batch_flatten(nse_input[:, read_input_length:, :])
+        mem_0 = K.batch_flatten(input_to_read)
         o = self.reader.call(input_to_read, input_mask)
         o_mask = self.reader.compute_mask(input_to_read, input_mask)
         return o, [mem_0, initial_shared_memory], o_mask
 
     @overrides
     def compose_and_write_step(self, o_t, states):
-        mem_tm1, shared_mem_tm1, writer_h_tm1, writer_c_tm1 = states
+        flattened_mem_tm1, flattened_shared_mem_tm1, writer_h_tm1, writer_c_tm1 = states
+        input_mem_shape = K.shape(flattened_mem_tm1)
+        mem_shape = (input_mem_shape[0], input_mem_shape[1]/self.output_dim, self.output_dim)
+        mem_tm1 = K.reshape(flattened_mem_tm1, mem_shape)
+        shared_mem_tm1 = K.reshape(flattened_shared_mem_tm1, mem_shape)
         z_t, m_rt = self.summarize_memory(o_t, mem_tm1)
         shared_z_t, shared_m_rt = self.summarize_memory(o_t, shared_mem_tm1)
         c_t = self.compose_memory_and_output([o_t, m_rt, shared_m_rt])
@@ -258,14 +271,14 @@ class MultipleMemoryAccessNSE(NSE):
         h_t, [_, writer_c_t] = self.writer.step(c_t, writer_states)  # h_t, writer_c_t: (batch_size, output_dim)
         mem_t = self.update_memory(z_t, h_t, mem_tm1)
         shared_mem_t = self.update_memory(shared_z_t, h_t, shared_mem_tm1)
-        return h_t, [mem_t, shared_mem_t, h_t, writer_c_t]
+        return h_t, [K.batch_flatten(mem_t), K.batch_flatten(shared_mem_t), h_t, writer_c_t]
 
 
 class InputMemoryMerger(Layer):
     '''
-    This layer taks as input the output of a NSE layer, and the embedded input to a MMANSE layer, and prepares
-    a single input tensor for MMANSE that is a concatenation of the first sentence's memory and the second
-    sentence's embedding.
+    This layer taks as input, the memory part of the output of a NSE layer, and the embedded input to a MMANSE
+    layer, and prepares a single input tensor for MMANSE that is a concatenation of the first sentence's memory
+    and the second sentence's embedding.
     This is a concrete layer instead of a lambda function because we want to support masking.
     '''
     def __init__(self, **kwargs):
@@ -276,18 +289,50 @@ class InputMemoryMerger(Layer):
         return (input_shapes[1][0], input_shapes[1][1]*2, input_shapes[1][2])
 
     def compute_mask(self, inputs, mask=None):
+        # pylint: disable=unused-argument
         if mask is None:
             return None
         elif mask == [None, None]:
             return None
         else:
-            nse_output_mask, mmanse_embed_mask = mask
-            memory_mask = nse_output_mask[:, 1:]  # (batch_size, nse_input_length)
+            memory_mask, mmanse_embed_mask = mask
             return K.concatenate([mmanse_embed_mask, memory_mask], axis=1)  # (batch_size, nse_input_length * 2)
         
     def call(self, inputs, mask=None):
-        nse_output_and_memory = inputs[0]
+        shared_memory = inputs[0]
         mmanse_embed_input = inputs[1]  # (batch_size, nse_input_length, output_dim)
-        shared_memory = nse_output_and_memory[:, 1:, :]  # (batch_size, nse_input_length, output_dim)
         return K.concatenate([mmanse_embed_input, shared_memory], axis=1)
-        
+
+class OutputSplitter(Layer):
+    '''
+    This layer takes the concatenation of output and memory from NSE and returns either the output or the
+    memory.
+    '''
+    def __init__(self, return_mode, **kwargs):
+        self.supperots_masking = True
+        if return_mode not in ["output", "memory"]:
+            raise Exception("Invalid return mode: %s" % return_mode)
+        self.return_mode = return_mode
+        super(OutputSplitter, self).__init__(**kwargs)
+
+    def get_output_shape_for(self, input_shape):
+        if self.return_mode == "output":
+            return (input_shape[0], input_shape[2])
+        else:
+            # Return mode is memory.
+            # input contains output and memory concatenated along the second dimension.
+            return (input_shape[0], input_shape[1] - 1, input_shape[2])
+
+    def compute_mask(self, inputs, mask=None):
+        # pylint: disable=unused-argument
+        if self.return_mode == "output" or mask is None:
+            return None
+        else:
+            # Return mode is memory and mask is not None
+            return mask[:, 1:]  # (batch_size, nse_input_length)
+
+    def call(self, inputs, mask=None):
+        if self.return_mode == "output":
+            return inputs[:, 0, :]  # (batch_size, output_dim)
+        else:
+            return inputs[:, 1:, :]  # (batch_size, nse_input_length, output_dim)
